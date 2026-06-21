@@ -267,7 +267,68 @@ def print_results(results):
         print(f"\n\n  亏损配方共 {len(losing)} 个（略）")
 
 
-def write_report(results, path="full_report.md"):
+# 循环回收输入材料（至暗之夜工程学可回收材料）
+# 产出：以太流明(243578) + 永恒之核(243581)
+RECYCLE_MATERIALS = [
+    # (item_id, name_zh, MatQualityWeight)
+    (237359, "折射铜矿石",    3),
+    (237362, "暗银锡矿石",    4),
+    (244697, "通量齿轮",      7),
+    (244699, "滑油齿轮",      7),
+    (244701, "完美齿轮",      7),
+    (244703, "吻合齿轮",      7),
+    (239702, "注魔亮麻布卷", 25),
+    (243574, "轻歌齿轮",     28),
+    (243576, "灵魂链齿",     31),
+    (238518, "虚空淬炼兽皮", 80),
+    (238520, "虚空淬炼铠甲", 80),
+]
+AETHERLUME_ID     = 243578
+AETHERLUME_WEIGHT = 41
+
+
+def _recycle_section(price_map):
+    aether_price, aether_qty, _ = market_info(price_map, AETHERLUME_ID)
+    if not aether_price:
+        return []
+
+    rows = []
+    for iid, name, weight in RECYCLE_MATERIALS:
+        price, qty, _ = market_info(price_map, iid)
+        if not price:
+            continue
+        output_per_5 = (5 * weight) / AETHERLUME_WEIGHT
+        cost_per = (price * 5 / output_per_5) if output_per_5 > 0 else float("inf")
+        cheaper = cost_per < aether_price
+        rows.append((cost_per, name, price, weight, output_per_5, cost_per, cheaper, qty))
+
+    rows.sort(key=lambda x: x[0])
+
+    lines = [
+        "## 工程学循环回收 — 获取以太流明效率",
+        f"",
+        f"以太流明当前价格：**{g(aether_price)}**（item 243578）",
+        f"",
+        f"> 公式：5件材料总权重 ÷ {AETHERLUME_WEIGHT} = 产出以太流明数（未经游戏实测，仅供参考）",
+        f"",
+        "| 材料 | 材料价格 | 权重 | 5件产出以太流明 | 成本/以太流明 | 划算? | 挂单量 |",
+        "|---|---|---|---|---|---|---|",
+    ]
+    for _, name, price, weight, out, cost_per, cheaper, qty in rows:
+        flag = "✓" if cheaper else "✗"
+        lines.append(f"| {name} | {g(price)} | {weight} | {out:.2f} | {g(cost_per)} | {flag} | {qty} |")
+
+    cheaper_rows = [r for r in rows if r[6]]
+    if cheaper_rows:
+        lines.append("")
+        lines.append("**最优回收顺序（比直接买以太流明划算）：**")
+        for i, (_, name, price, weight, out, cost_per, _, qty) in enumerate(cheaper_rows, 1):
+            lines.append(f"{i}. {name}（{g(price)}/件，每5件出 {out:.1f} 个以太流明，折合 {g(cost_per)}/个）")
+
+    return lines
+
+
+def write_report(results, price_map=None, path="full_report.md"):
     profitable = [r for r in results if r["profit"] > 0]
     losing     = [r for r in results if r["profit"] <= 0]
 
@@ -284,14 +345,11 @@ def write_report(results, path="full_report.md"):
             lines.append(f"| {r['name']} | {g(r['cost'])} | {g(r['sell_total'])} | {g(r['profit'])} | {margin}% | {r['sell_qty']} | {r['sell_listings']} |")
         lines.append("")
 
-    lines.append(f"## 亏损配方（共 {len(losing)} 个）\n")
-    for prof_name, items in _group_by_prof(losing):
-        lines.append(f"### {prof_name}\n")
-        lines.append("| 配方 | 材料成本 | 卖合计 | 总利润 | 挂单量 | 卖家数 |")
-        lines.append("|---|---|---|---|---|---|")
-        for r in items:
-            lines.append(f"| {r['name']} | {g(r['cost'])} | {g(r['sell_total'])} | {g(r['profit'])} | {r['sell_qty']} | {r['sell_listings']} |")
+    lines.append(f"---\n亏损配方共 {len(losing)} 个（略）\n")
+
+    if price_map:
         lines.append("")
+        lines.extend(_recycle_section(price_map))
 
     with open(path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
@@ -321,7 +379,7 @@ def main():
     with open("analysis.json", "w", encoding="utf-8") as f:
         json.dump(results, f, ensure_ascii=False, indent=2, default=str)
     print(f"[OK] 已保存 analysis.json")
-    write_report(results)
+    write_report(results, price_map)
 
 
 if __name__ == "__main__":
