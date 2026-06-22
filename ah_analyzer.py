@@ -156,19 +156,32 @@ def load_recipes(conn, prof_ids=None):
         ).fetchall()
         output_ids = [r[0] for r in output_ids_rows] if output_ids_rows else ([crafted_id] if crafted_id else [])
         result.append({
-            "spell_id":   spell_id,
-            "name":       name_zh or name,
-            "name_en":    name,
-            "crafted_id": crafted_id,
-            "output_ids": output_ids,
-            "output_qty": output_qty,
-            "category":   category,
-            "prof_id":    prof_id,
-            "prof_name":  prof_zh or prof_en,
-            "reagents":   reagents,
-            "tier_id":    tier_id,
-            "tier_name":  tier_name,
+            "spell_id":    spell_id,
+            "name":        name_zh or name,
+            "name_en":     name,
+            "crafted_id":  crafted_id,
+            "output_ids":  output_ids,
+            "output_qty":  output_qty,
+            "category":    category,
+            "prof_id":     prof_id,
+            "prof_name":   prof_zh or prof_en,
+            "reagents":    reagents,
+            "tier_id":     tier_id,
+            "tier_name":   tier_name,
+            "quality_star": None,  # 由下方赋值
         })
+
+    # 龙岛+版本：同职业同tier同名配方按 crafted_item_id 升序打星标（Q1最小ID→★，以此类推）
+    quality_groups = defaultdict(list)
+    for rec in result:
+        if rec["tier_id"] >= _QUALITY_TIER_MIN and rec["crafted_id"]:
+            quality_groups[(rec["prof_id"], rec["tier_id"], rec["name_en"])].append(rec)
+    for group in quality_groups.values():
+        if len(group) > 1:
+            group.sort(key=lambda x: x["crafted_id"])
+            for i, rec in enumerate(group):
+                rec["quality_star"] = _STAR[i] if i < len(_STAR) else f"Q{i+1}"
+
     return result
 
 
@@ -193,24 +206,25 @@ def analyze(recipes, price_map):
         if not ok:
             continue
 
-        # 查所有已知产出 ID，取流通性最好（挂单量最多）的那个
+        # 取价格最高的产出（多产出时如 WotLK proc，取高价那个）
         best = None
         for oid in rec["output_ids"]:
             p = floor_price(price_map, oid)
             if p is None:
                 continue
             _, qty, listings = market_info(price_map, oid)
-            if best is None or qty > best["sell_qty"]:
+            if best is None or p > best["sell_price"]:
                 best = {"sell_id": oid, "sell_price": p, "sell_qty": qty, "sell_listings": listings}
 
         if best is None:
             continue
 
-        sell_price   = best["sell_price"]
-        sell_total   = int(sell_price * output_qty * (1 - AH_FEE))
-        profit       = sell_total - cost
+        sell_price = best["sell_price"]
+        sell_total = int(sell_price * output_qty * (1 - AH_FEE))
+        profit     = sell_total - cost
+        name = rec["name"] + (" " + rec["quality_star"] if rec["quality_star"] else "")
         results.append({
-            "name":          rec["name"],
+            "name":          name,
             "name_en":       rec["name_en"],
             "category":      rec["category"],
             "prof_id":       rec["prof_id"],
@@ -231,15 +245,20 @@ def analyze(recipes, price_map):
 
     results.sort(key=lambda x: x["profit"], reverse=True)
 
-    # 同一职业下同名配方去重，只保留利润最高的（避免多版本重复）
+    # 同一 crafted_id 全局去重
     seen = set()
     deduped = []
     for r in results:
-        key = (r["prof_id"], r["name"], r["crafted_id"])
-        if key not in seen:
-            seen.add(key)
+        if r["crafted_id"] not in seen:
+            seen.add(r["crafted_id"])
             deduped.append(r)
+
     return deduped
+
+
+_STAR = ["★", "★★", "★★★", "★★★★", "★★★★★"]
+# 龙岛及以后才有制作品质分级系统（tier_id >= 2822）
+_QUALITY_TIER_MIN = 2822
 
 
 _PROF_SUFFIXES = [
