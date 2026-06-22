@@ -123,25 +123,29 @@ def load_recipes(conn, prof_ids=None):
         placeholders = ",".join("?" * len(prof_ids))
         rows = conn.execute(f"""
             SELECT r.spell_id, r.name_zh, r.name, r.crafted_item_id, r.output_qty,
-                   r.category, r.profession_id, p.name_zh, p.name
+                   r.category, r.profession_id, p.name_zh, p.name,
+                   r.skill_tier_id, t.name
             FROM recipes r
             JOIN professions p ON p.id = r.profession_id
+            JOIN skill_tiers t ON t.id = r.skill_tier_id
             WHERE r.profession_id IN ({placeholders})
             {exclude_clause}
-            ORDER BY r.profession_id, r.category, r.name
+            ORDER BY r.skill_tier_id DESC, r.profession_id, r.name
         """, prof_ids + list(EXCLUDE_CATEGORIES)).fetchall()
     else:
         rows = conn.execute(f"""
             SELECT r.spell_id, r.name_zh, r.name, r.crafted_item_id, r.output_qty,
-                   r.category, r.profession_id, p.name_zh, p.name
+                   r.category, r.profession_id, p.name_zh, p.name,
+                   r.skill_tier_id, t.name
             FROM recipes r
             JOIN professions p ON p.id = r.profession_id
+            JOIN skill_tiers t ON t.id = r.skill_tier_id
             WHERE 1=1 {exclude_clause}
-            ORDER BY r.profession_id, r.category, r.name
+            ORDER BY r.skill_tier_id DESC, r.profession_id, r.name
         """, list(EXCLUDE_CATEGORIES)).fetchall()
 
     result = []
-    for spell_id, name_zh, name, crafted_id, output_qty, category, prof_id, prof_zh, prof_en in rows:
+    for spell_id, name_zh, name, crafted_id, output_qty, category, prof_id, prof_zh, prof_en, tier_id, tier_name in rows:
         reagents = conn.execute(
             "SELECT item_id, quantity FROM recipe_reagents WHERE spell_id = ?",
             (spell_id,)
@@ -162,6 +166,8 @@ def load_recipes(conn, prof_ids=None):
             "prof_id":    prof_id,
             "prof_name":  prof_zh or prof_en,
             "reagents":   reagents,
+            "tier_id":    tier_id,
+            "tier_name":  tier_name,
         })
     return result
 
@@ -209,6 +215,8 @@ def analyze(recipes, price_map):
             "category":      rec["category"],
             "prof_id":       rec["prof_id"],
             "prof_name":     rec["prof_name"],
+            "tier_id":       rec["tier_id"],
+            "tier_name":     rec["tier_name"],
             "spell_id":      rec["spell_id"],
             "crafted_id":    best["sell_id"],
             "output_qty":    output_qty,
@@ -234,9 +242,45 @@ def analyze(recipes, price_map):
     return deduped
 
 
+_PROF_SUFFIXES = [
+    "Blacksmithing", "Leatherworking", "Alchemy", "Cooking", "Tailoring",
+    "Engineering", "Enchanting", "Jewelcrafting", "Inscription",
+]
+
+def _expansion_name(tier_name):
+    """从 tier 名称提取版本名，去掉职业后缀。"""
+    name = tier_name
+    for s in _PROF_SUFFIXES:
+        name = name.replace(s, "")
+    return name.strip(" /").strip() or tier_name
+
+
+def _group_by_tier(results):
+    """
+    按版本（expansion）分组，版本内再按职业分组。
+    版本按 tier_id 降序（新版本在前），职业内按利润降序。
+    返回 [(expansion_name, tier_id, [(prof_name, [recipe, ...])])]
+    """
+    tier_map = defaultdict(lambda: defaultdict(list))
+    tier_ids = {}
+    for r in results:
+        exp = _expansion_name(r["tier_name"])
+        tier_map[exp][r["prof_name"]].append(r)
+        tier_ids[exp] = max(tier_ids.get(exp, 0), r["tier_id"])
+
+    grouped = []
+    for exp, profs in tier_map.items():
+        for v in profs.values():
+            v.sort(key=lambda x: x["profit"], reverse=True)
+        prof_list = sorted(profs.items(), key=lambda kv: kv[1][0]["profit"], reverse=True)
+        grouped.append((exp, tier_ids[exp], prof_list))
+
+    grouped.sort(key=lambda x: x[1], reverse=True)
+    return grouped
+
+
 def _group_by_prof(results):
     """按职业分组，组间按组内最高利润降序，组内按利润降序。"""
-    from collections import defaultdict
     groups = defaultdict(list)
     for r in results:
         groups[r["prof_name"]].append(r)
@@ -255,13 +299,15 @@ def print_results(results):
     print(f"  {'配方':<26}  {'材料成本':>12}  {'卖合计':>12}  {'总利润':>12}  {'挂单量':>6}  {'卖家数':>6}")
     print(f"  {'-'*98}")
 
-    for prof_name, items in _group_by_prof(profitable):
-        print(f"\n  ── {prof_name} ──")
-        for r in items:
-            print(f"  {r['name']:<26}  "
-                  f"{g(r['cost']):>12}  {g(r['sell_total']):>12}  "
-                  f"{g(r['profit']):>12}  "
-                  f"{r['sell_qty']:>6}  {r['sell_listings']:>6}")
+    for exp, tier_id, profs in _group_by_tier(profitable):
+        print(f"\n  ══ {exp} ══")
+        for prof_name, items in profs:
+            print(f"\n    ── {prof_name} ──")
+            for r in items:
+                print(f"  {r['name']:<26}  "
+                      f"{g(r['cost']):>12}  {g(r['sell_total']):>12}  "
+                      f"{g(r['profit']):>12}  "
+                      f"{r['sell_qty']:>6}  {r['sell_listings']:>6}")
 
     if losing:
         print(f"\n\n  亏损配方共 {len(losing)} 个（略）")
@@ -336,14 +382,16 @@ def write_report(results, price_map=None, path="full_report.md"):
              f"盈利配方 {len(profitable)} 个 | 亏损配方 {len(losing)} 个\n",
              f"## 盈利配方\n"]
 
-    for prof_name, items in _group_by_prof(profitable):
-        lines.append(f"### {prof_name}\n")
-        lines.append("| 配方 | 材料成本 | 卖合计 | 总利润 | 利润率 | 挂单量 | 卖家数 |")
-        lines.append("|---|---|---|---|---|---|---|")
-        for r in items:
-            margin = int(r["profit"] / r["cost"] * 100) if r["cost"] else 0
-            lines.append(f"| {r['name']} | {g(r['cost'])} | {g(r['sell_total'])} | {g(r['profit'])} | {margin}% | {r['sell_qty']} | {r['sell_listings']} |")
-        lines.append("")
+    for exp, tier_id, profs in _group_by_tier(profitable):
+        lines.append(f"## {exp}\n")
+        for prof_name, items in profs:
+            lines.append(f"### {prof_name}\n")
+            lines.append("| 配方 | 材料成本 | 卖合计 | 总利润 | 利润率 | 挂单量 | 卖家数 |")
+            lines.append("|---|---|---|---|---|---|---|")
+            for r in items:
+                margin = int(r["profit"] / r["cost"] * 100) if r["cost"] else 0
+                lines.append(f"| {r['name']} | {g(r['cost'])} | {g(r['sell_total'])} | {g(r['profit'])} | {margin}% | {r['sell_qty']} | {r['sell_listings']} |")
+            lines.append("")
 
     lines.append(f"---\n亏损配方共 {len(losing)} 个（略）\n")
 

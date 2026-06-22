@@ -7,7 +7,7 @@
 运行一次即可，配方数据不会频繁变化。
 """
 
-import sys, io, sqlite3, requests, re, time, os
+import sys, io, sqlite3, requests, re, time, os, datetime
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -34,18 +34,11 @@ def get_token():
     return r.json()["access_token"]
 
 
-def blizz_get(token, path):
-    r = requests.get(f"{API_BASE}{path}",
-                     params={"namespace": "static-us", "locale": "en_US"},
-                     headers={"Authorization": f"Bearer {token}"}, timeout=30)
-    r.raise_for_status()
-    return r.json()
 
-
-def get_latest_skill_tier(token, prof_id):
+def get_all_skill_tiers(token, prof_id):
     """
-    动态取该职业 ID 最大的技能层（最新版本内容）。
-    返回 (tier_id, tier_name, prof_name_en, prof_name_zh)。
+    返回该职业所有技能层列表和职业名称。
+    返回 ([(tier_id, tier_name), ...], prof_name_en, prof_name_zh)。
     """
     def fetch(locale):
         r = requests.get(f"{API_BASE}/data/wow/profession/{prof_id}",
@@ -57,11 +50,8 @@ def get_latest_skill_tier(token, prof_id):
     en = fetch("en_US")
     zh = fetch("zh_CN")
 
-    tiers = en.get("skill_tiers", [])
-    if not tiers:
-        return None, None, None, None
-    latest = max(tiers, key=lambda t: t["id"])
-    return latest["id"], latest["name"], en["name"], zh["name"]
+    tiers = [(t["id"], t["name"]) for t in en.get("skill_tiers", [])]
+    return tiers, en["name"], zh["name"]
 
 
 def get_recipes_in_tier(token, prof_id, tier_id):
@@ -208,6 +198,12 @@ def init_db(conn):
             spell_id INTEGER NOT NULL REFERENCES recipes(spell_id),
             item_id  INTEGER NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS completed_tiers (
+            tier_id       INTEGER PRIMARY KEY,
+            profession_id INTEGER NOT NULL,
+            finished_at   TEXT NOT NULL
+        );
     """)
     conn.commit()
 
@@ -222,10 +218,13 @@ def upsert_recipe(conn, spell_id, blizz_id, prof_id, tier_id,
         VALUES (?,?,?,?,?,?,?,?,?)
     """, (spell_id, blizz_id, prof_id, tier_id, category, name, name_zh, primary_id, output_qty))
 
+    output_set = set(crafted_ids)
+    clean_reagents = [(iid, qty) for iid, qty in reagents if iid not in output_set]
+
     conn.execute("DELETE FROM recipe_reagents WHERE spell_id=?", (spell_id,))
     conn.executemany(
         "INSERT INTO recipe_reagents (spell_id, item_id, quantity) VALUES (?,?,?)",
-        [(spell_id, iid, qty) for iid, qty in reagents]
+        [(spell_id, iid, qty) for iid, qty in clean_reagents]
     )
 
     conn.execute("DELETE FROM recipe_outputs WHERE spell_id=?", (spell_id,))
@@ -244,64 +243,88 @@ def build(token, conn, prof_ids):
     total_ok = total_skip = 0
 
     for prof_id in prof_ids:
-        tier_id, tier_name, prof_name, prof_name_zh = get_latest_skill_tier(token, prof_id)
-        if not tier_id:
+        tiers, prof_name, prof_name_zh = get_all_skill_tiers(token, prof_id)
+        if not tiers:
             print(f"  [跳过] profession {prof_id}：无技能层")
             continue
 
         conn.execute("INSERT OR IGNORE INTO professions (id, name, name_zh) VALUES (?,?,?)",
                      (prof_id, prof_name, prof_name_zh))
-        conn.execute("INSERT OR IGNORE INTO skill_tiers (id, profession_id, name) VALUES (?,?,?)",
-                     (tier_id, prof_id, tier_name))
         conn.commit()
 
-        print(f"\n[{prof_name}] {tier_name}  (tier_id={tier_id})")
-
-        try:
-            recipes = get_recipes_in_tier(token, prof_id, tier_id)
-        except Exception as e:
-            print(f"  拉取配方列表失败: {e}")
-            continue
-
-        # 每个职业独立的 seen_spells，避免跨职业污染
+        # 每个职业共享 seen_spells，避免不同版本同一配方重复抓
         seen_spells = set()
 
-        for blizz_id, name, name_zh, category in recipes:
+        done_tiers = {row[0] for row in conn.execute(
+            "SELECT tier_id FROM completed_tiers WHERE profession_id=?", (prof_id,)
+        ).fetchall()}
+
+        for tier_id, tier_name in tiers:
+            conn.execute("INSERT OR IGNORE INTO skill_tiers (id, profession_id, name) VALUES (?,?,?)",
+                         (tier_id, prof_id, tier_name))
+            conn.commit()
+
+            if tier_id in done_tiers:
+                print(f"\n[{prof_name}] {tier_name}  (tier_id={tier_id}) — 已完成，跳过")
+                # 已完成的 tier 的 spell_id 也要加入 seen_spells，避免后续 tier 重复插入
+                for (sid,) in conn.execute(
+                    "SELECT spell_id FROM recipes WHERE skill_tier_id=?", (tier_id,)
+                ).fetchall():
+                    seen_spells.add(sid)
+                continue
+
+            print(f"\n[{prof_name}] {tier_name}  (tier_id={tier_id})")
+
             try:
-                candidates = wh_search(name)
-                inserted = False
-
-                for spell_id, item_id in candidates:
-                    if spell_id in seen_spells:
-                        continue
-
-                    html = wh_tooltip_html(spell_id)
-                    if not html:
-                        continue
-
-                    reagents = parse_reagents(html)
-                    if not reagents:
-                        continue
-
-                    crafted_ids, output_qty = parse_output(html)
-                    if not crafted_ids:
-                        crafted_ids = [item_id]
-                    upsert_recipe(conn, spell_id, blizz_id, prof_id, tier_id,
-                                  category, name, name_zh, crafted_ids, output_qty, reagents)
-                    seen_spells.add(spell_id)
-                    inserted = True
-                    total_ok += 1
-                    print(f"  [OK] {name} / {name_zh}  产出 {crafted_ids} x{output_qty}  材料 {len(reagents)} 种")
-
-                if not inserted:
-                    total_skip += 1
-                    print(f"  [--] {name}  未找到 Wowhead 数据")
-
-                time.sleep(0.5)
-
+                recipes = get_recipes_in_tier(token, prof_id, tier_id)
             except Exception as e:
-                print(f"  [ERR] {name}: {e}")
-                total_skip += 1
+                print(f"  拉取配方列表失败: {e}")
+                continue
+
+            for blizz_id, name, name_zh, category in recipes:
+                try:
+                    candidates = wh_search(name)
+                    inserted = False
+
+                    for spell_id, item_id in candidates:
+                        if spell_id in seen_spells:
+                            continue
+
+                        html = wh_tooltip_html(spell_id)
+                        if not html:
+                            continue
+
+                        reagents = parse_reagents(html)
+                        if not reagents:
+                            continue
+
+                        crafted_ids, output_qty = parse_output(html)
+                        if not crafted_ids:
+                            crafted_ids = [item_id]
+                        upsert_recipe(conn, spell_id, blizz_id, prof_id, tier_id,
+                                      category, name, name_zh, crafted_ids, output_qty, reagents)
+                        seen_spells.add(spell_id)
+                        inserted = True
+                        total_ok += 1
+                        print(f"  [OK] {name} / {name_zh}  产出 {crafted_ids} x{output_qty}  材料 {len(reagents)} 种")
+
+                    if not inserted:
+                        total_skip += 1
+                        print(f"  [--] {name}  未找到 Wowhead 数据")
+
+                    time.sleep(0.5)
+
+                except Exception as e:
+                    print(f"  [ERR] {name}: {e}")
+                    total_skip += 1
+
+            # tier 全部处理完，标记已完成
+            conn.execute(
+                "INSERT OR REPLACE INTO completed_tiers (tier_id, profession_id, finished_at) VALUES (?,?,?)",
+                (tier_id, prof_id, datetime.datetime.now().isoformat())
+            )
+            conn.commit()
+            print(f"  [√] {tier_name} 完成并已记录")
 
     print(f"\n入库：{total_ok} 个配方，跳过：{total_skip} 个")
 
@@ -319,16 +342,23 @@ def main():
     else:
         prof_ids = CRAFTING_PROF_IDS
 
-    if os.path.exists(DB_FILE):
-        os.remove(DB_FILE)
-        print(f"[*] 已删除旧数据库 {DB_FILE}")
-
     token = get_token()
     print(f"[OK] Token 获取成功")
 
     conn = sqlite3.connect(DB_FILE)
     init_db(conn)
     print(f"[OK] 数据库初始化完成：{DB_FILE}")
+
+    # 清理存量脏数据：产出 item 混入材料
+    dirty = conn.execute("""
+        SELECT rr.spell_id, rr.item_id FROM recipe_reagents rr
+        JOIN recipe_outputs ro ON ro.spell_id = rr.spell_id AND ro.item_id = rr.item_id
+    """).fetchall()
+    if dirty:
+        for spell_id, item_id in dirty:
+            conn.execute("DELETE FROM recipe_reagents WHERE spell_id=? AND item_id=?", (spell_id, item_id))
+        conn.commit()
+        print(f"[FIX] 清除产出混入材料的脏数据 {len(dirty)} 条")
 
     build(token, conn, prof_ids)
 
