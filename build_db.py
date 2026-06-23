@@ -20,6 +20,8 @@ DB_FILE       = "wow_recipes.db"
 
 # 制造业职业 ID（跳过草药/采矿/剥皮/钓鱼等纯采集职业）
 CRAFTING_PROF_IDS = [164, 165, 171, 185, 197, 202, 333, 755, 773]
+# Dragon Isles 及以后才有制作品质分级（Q1/Q2/Q3），tier_id 起点
+QUALITY_TIER_MIN = 2822
 
 
 # ──────────────────────────────────────────────
@@ -308,6 +310,22 @@ def build(token, conn, prof_ids):
                         total_ok += 1
                         print(f"  [OK] {name} / {name_zh}  产出 {crafted_ids} x{output_qty}  材料 {len(reagents)} 种")
 
+                    # 兜底：若 wh_search 未能插入，直接用 blizz_id 取 tooltip
+                    # blizz_recipe_id 就是 WoW spell_id，Wowhead 可能有但搜索不返回
+                    if not inserted and blizz_id not in seen_spells:
+                        html = wh_tooltip_html(blizz_id)
+                        if html:
+                            reagents = parse_reagents(html)
+                            if reagents:
+                                crafted_ids, output_qty = parse_output(html)
+                                if crafted_ids:
+                                    upsert_recipe(conn, blizz_id, blizz_id, prof_id, tier_id,
+                                                 category, name, name_zh, crafted_ids, output_qty, reagents)
+                                    seen_spells.add(blizz_id)
+                                    inserted = True
+                                    total_ok += 1
+                                    print(f"  [Q+] {name} / {name_zh}  产出 {crafted_ids} x{output_qty}  (直接ID)")
+
                     if not inserted:
                         total_skip += 1
                         print(f"  [--] {name}  未找到 Wowhead 数据")
@@ -329,15 +347,114 @@ def build(token, conn, prof_ids):
     print(f"\n入库：{total_ok} 个配方，跳过：{total_skip} 个")
 
 
+def fill_quality_gaps(token, conn, prof_ids):
+    """
+    专门补充龙岛+(tier_id>=2822)配方缺失的品质层级。
+
+    Blizzard API 对每个品质层级有单独的 blizz_recipe_id（即 WoW spell_id）。
+    当 wh_search 只找到 Q1 时，Q2/Q3 spell_id 未被存入 DB。
+    本函数直接用这些 blizz_id 请求 Wowhead tooltip，填补缺口。
+
+    用法：python build_db.py --gaps [prof_id ...]
+    """
+    total_ok = total_skip = 0
+
+    for prof_id in prof_ids:
+        tiers, prof_name, _ = get_all_skill_tiers(token, prof_id)
+        di_tiers = [(tid, tname) for tid, tname in tiers if tid >= QUALITY_TIER_MIN]
+        if not di_tiers:
+            continue
+
+        print(f"\n[{prof_name}] 检查 {len(di_tiers)} 个龙岛+技能层")
+
+        stored_spells = {row[0] for row in conn.execute(
+            "SELECT spell_id FROM recipes WHERE profession_id=?", (prof_id,)
+        ).fetchall()}
+
+        for tier_id, tier_name in di_tiers:
+            try:
+                recipes = get_recipes_in_tier(token, prof_id, tier_id)
+            except Exception as e:
+                print(f"  拉取 {tier_name} 失败: {e}")
+                continue
+
+            # 按名字分组
+            name_entries = {}
+            for blizz_id, name, name_zh, category in recipes:
+                name_entries.setdefault(name, []).append((blizz_id, name_zh, category))
+
+            for name, entries in name_entries.items():
+                if len(entries) <= 1:
+                    continue  # 单品质，无需补全
+
+                missing = [(bid, nz, cat) for bid, nz, cat in entries if bid not in stored_spells]
+                if not missing:
+                    continue
+
+                print(f"\n  [{tier_name}] {name}: Blizzard有{len(entries)}个品质，缺{len(missing)}个")
+
+                for blizz_id, name_zh, category in missing:
+                    try:
+                        html = wh_tooltip_html(blizz_id)
+                        if not html:
+                            print(f"    [--] spell {blizz_id}  无 tooltip")
+                            total_skip += 1
+                            time.sleep(0.5)
+                            continue
+
+                        reagents = parse_reagents(html)
+                        if not reagents:
+                            # 从同名已存配方复制材料（同品质配方材料相同）
+                            reagents = conn.execute(
+                                "SELECT rr.item_id, rr.quantity FROM recipe_reagents rr "
+                                "JOIN recipes r ON r.spell_id = rr.spell_id "
+                                "WHERE r.skill_tier_id=? AND r.name=? LIMIT 30",
+                                (tier_id, name)
+                            ).fetchall()
+                            if not reagents:
+                                print(f"    [--] spell {blizz_id}  无材料且无可复制来源")
+                                total_skip += 1
+                                time.sleep(0.5)
+                                continue
+                            print(f"    [~] 材料从已存配方复制")
+
+                        crafted_ids, output_qty = parse_output(html)
+                        if not crafted_ids:
+                            print(f"    [--] spell {blizz_id}  无法解析产出物")
+                            total_skip += 1
+                            time.sleep(0.5)
+                            continue
+
+                        upsert_recipe(conn, blizz_id, blizz_id, prof_id, tier_id,
+                                     category, name, name_zh, crafted_ids, output_qty, reagents)
+                        stored_spells.add(blizz_id)
+                        total_ok += 1
+                        print(f"    [OK] spell {blizz_id}  产出 {crafted_ids} x{output_qty}  材料 {len(reagents)} 种")
+
+                    except Exception as e:
+                        print(f"    [ERR] spell {blizz_id}: {e}")
+                        total_skip += 1
+
+                    time.sleep(0.5)
+
+    print(f"\n补全：+{total_ok} 个品质层，跳过：{total_skip} 个")
+
+
 def main():
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
 
-    # 可通过命令行指定职业 ID，否则跑全部
-    # 例：python build_db.py 171        → 只跑炼金
-    # 例：python build_db.py 171 333    → 炼金+附魔
-    # 例：python build_db.py            → 全部制造业
-    if len(sys.argv) > 1:
-        prof_ids = [int(x) for x in sys.argv[1:]]
+    # 用法：
+    #   python build_db.py                 → 全量构建所有职业
+    #   python build_db.py 171             → 只构建炼金
+    #   python build_db.py 171 333         → 炼金+附魔
+    #   python build_db.py --gaps          → 补全龙岛+缺失品质（全职业）
+    #   python build_db.py --gaps 197      → 补全龙岛+缺失品质（裁缝）
+    args = sys.argv[1:]
+    gaps_mode = "--gaps" in args
+    id_args = [x for x in args if x != "--gaps"]
+
+    if id_args:
+        prof_ids = [int(x) for x in id_args]
         print(f"[*] 只处理职业：{prof_ids}")
     else:
         prof_ids = CRAFTING_PROF_IDS
@@ -349,18 +466,22 @@ def main():
     init_db(conn)
     print(f"[OK] 数据库初始化完成：{DB_FILE}")
 
-    # 清理存量脏数据：产出 item 混入材料
-    dirty = conn.execute("""
-        SELECT rr.spell_id, rr.item_id FROM recipe_reagents rr
-        JOIN recipe_outputs ro ON ro.spell_id = rr.spell_id AND ro.item_id = rr.item_id
-    """).fetchall()
-    if dirty:
-        for spell_id, item_id in dirty:
-            conn.execute("DELETE FROM recipe_reagents WHERE spell_id=? AND item_id=?", (spell_id, item_id))
-        conn.commit()
-        print(f"[FIX] 清除产出混入材料的脏数据 {len(dirty)} 条")
+    if gaps_mode:
+        print("[*] 模式：补全龙岛+缺失品质层级")
+        fill_quality_gaps(token, conn, prof_ids)
+    else:
+        # 清理存量脏数据：产出 item 混入材料
+        dirty = conn.execute("""
+            SELECT rr.spell_id, rr.item_id FROM recipe_reagents rr
+            JOIN recipe_outputs ro ON ro.spell_id = rr.spell_id AND ro.item_id = rr.item_id
+        """).fetchall()
+        if dirty:
+            for spell_id, item_id in dirty:
+                conn.execute("DELETE FROM recipe_reagents WHERE spell_id=? AND item_id=?", (spell_id, item_id))
+            conn.commit()
+            print(f"[FIX] 清除产出混入材料的脏数据 {len(dirty)} 条")
 
-    build(token, conn, prof_ids)
+        build(token, conn, prof_ids)
 
     conn.close()
     print(f"\n[OK] 完成，数据库已保存：{DB_FILE}")

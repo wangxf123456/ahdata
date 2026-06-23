@@ -332,6 +332,81 @@ def print_results(results):
         print(f"\n\n  亏损配方共 {len(losing)} 个（略）")
 
 
+# ── 珠宝加工选矿（12.0.7）──────────────────────────────────────
+# 每次选矿消耗 5 个矿石；各宝石概率独立判定（非互斥）
+# 概率数据来源：wow-professions.com Midnight JC Guide
+PROSPECT_GEMS = {
+    242553: "血色榴石",
+    242554: "阿曼尼青金石",
+    242606: "晦暗紫晶",
+    242607: "哈籁恩达尔榄石",
+    242610: "无瑕哈籁恩达尔榄石",
+    242611: "无瑕晦暗紫晶",
+    242612: "无瑕阿曼尼青金石",
+    242613: "无瑕血色榴石",
+}
+
+PROSPECT_ORES = [
+    # (ore_id, name_zh, [(gem_id, prob), ...])
+    (237359, "折射铜矿石", [
+        (242553, 0.08), (242554, 0.08), (242606, 0.08), (242607, 0.08),
+    ]),
+    (237362, "暗银锡矿石", [
+        (242607, 0.12), (242606, 0.12), (242610, 0.12), (242611, 0.12),
+    ]),
+    (237364, "辉熠银矿石", [
+        (242553, 0.12), (242554, 0.12), (242613, 0.12), (242612, 0.12),
+    ]),
+    (237366, "炫目瑟银", [
+        (242613, 0.15), (242612, 0.15), (242610, 0.15), (242611, 0.15),
+    ]),
+]
+
+
+def _prospect_section(price_map):
+    lines = [
+        "## 珠宝加工选矿效率分析（12.0.7）",
+        "",
+        "> 每次选矿消耗 5 个矿石。各宝石独立判定，概率来自 wow-professions.com。",
+        "> 炫目瑟银另有 22% 概率产出永歌钻石（需解锁专精），此处未计入。",
+        "",
+    ]
+
+    for ore_id, ore_name, yields in PROSPECT_ORES:
+        ore_price, ore_qty, _ = market_info(price_map, ore_id)
+        if not ore_price:
+            continue
+
+        cost = ore_price * 5
+        total_ev = 0
+        gem_rows = []
+        for gem_id, prob in yields:
+            gp, gqty, _ = market_info(price_map, gem_id)
+            if not gp:
+                continue
+            ev = int(gp * prob)
+            total_ev += ev
+            gem_rows.append((PROSPECT_GEMS.get(gem_id, str(gem_id)), gp, prob, ev, gqty))
+
+        if not gem_rows:
+            continue
+
+        profit    = total_ev - cost
+        sign      = "✓ 盈利" if profit > 0 else "✗ 亏损"
+
+        lines.append(f"### {ore_name}（{g(ore_price)}/个 × 5 = {g(cost)}，挂单={ore_qty}）")
+        lines.append("")
+        lines.append("| 宝石 | 市价 | 概率 | 期望产值 | 宝石挂单量 |")
+        lines.append("|---|---|---|---|---|")
+        for gname, gp, prob, ev, gqty in gem_rows:
+            lines.append(f"| {gname} | {g(gp)} | {prob:.0%} | {g(ev)} | {gqty} |")
+        lines.append("")
+        lines.append(f"**5矿期望宝石产值：{g(total_ev)}　成本：{g(cost)}　差额：{g(profit)}　{sign}**")
+        lines.append("")
+
+    return lines
+
+
 # 循环回收输入材料（至暗之夜工程学可回收材料）
 # 产出：以太流明(243578) + 永恒之核(243581)
 RECYCLE_MATERIALS = [
@@ -415,6 +490,8 @@ def write_report(results, price_map=None, path="full_report.md"):
     lines.append(f"---\n亏损配方共 {len(losing)} 个（略）\n")
 
     if price_map:
+        lines.append("")
+        lines.extend(_prospect_section(price_map))
         lines.append("")
         lines.extend(_recycle_section(price_map))
 
