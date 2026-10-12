@@ -19,6 +19,9 @@ API_BASE  = f"https://{REGION}.api.blizzard.com"
 TOKEN_URL = "https://oauth.battle.net/token"
 AH_FEE    = 0.05
 DB_FILE   = "wow_recipes.db"
+SNAPSHOT  = "commodities_raw.json"
+BATCH         = 20   # 按连续制作 20 次估算材料买入均价
+SELL_MIN_QTY  = 5    # 产出物全区挂单少于此数视为无市场
 
 
 # ──────────────────────────────────────────────
@@ -70,11 +73,30 @@ def market_info(price_map, item_id, min_copper=500):
     return listings[0][0], total_qty, num_listings
 
 
-def floor_price(price_map, item_id, min_copper=500, min_total_qty=5):
-    price, total_qty, _ = market_info(price_map, item_id, min_copper)
-    if price is None or total_qty < min_total_qty:
+def buy_price(price_map, item_id, units):
+    """
+    买入 units 个的平均单价（从最低价往上吃单）。挂单总量不足返回 None。
+    比只看最低价更真实：低价挂单往往只有几个，批量制作时要吃到更贵的单。
+    """
+    need, spent = units, 0
+    for p, q in price_map.get(item_id, []):
+        take = min(q, need)
+        spent += p * take
+        need  -= take
+        if need <= 0:
+            return spent / units
+    return None
+
+
+def sell_price(price_map, item_id, min_total_qty=SELL_MIN_QTY):
+    """
+    卖价 = 当前最低挂单价（你要挂得比它低才能卖出）。
+    市场上总量太少的物品价格不可信，返回 None。
+    """
+    listings = price_map.get(item_id, [])
+    if sum(q for _, q in listings) < min_total_qty:
         return None
-    return price
+    return listings[0][0]
 
 
 def g(copper):
@@ -90,175 +112,97 @@ def g(copper):
 # ──────────────────────────────────────────────
 
 def load_recipes(conn, prof_ids=None):
-    # 过滤掉不在商品拍卖行的品类（装备、坐骑、家具等走普通拍卖行，价格不准）
-    EXCLUDE_CATEGORIES = (
-        # 通用占位
-        "Appendix II - Stats",
-        # 装备（铁匠）
-        "Weapons", "Armor", "Competitor's Plate (PvP)",
-        # 装备（制皮）
-        "Mail Armor", "Leather Armor",
-        "Competitor's Mail Armor", "Competitor's Leather Armor", "Mounts",
-        # 装备（裁缝）
-        "Garments", "Arcanoweave Garments", "Sunfire Silk Garments",
-        "Competitor's Crafts (PvP)", "Wardrobe Enhancements",
-        # 装备（工程）
-        "Plate Equipment", "Mail Equipment", "Leather Equipment", "Cloth Equipment",
-        "Guns", "Bots",
-        # 装备（珠宝）
-        "Crafting Couture", "Regal Rings", "Luxurious Lockets",
-        "Competitor's Crafts (PvP)",
-        # 装备（铭文）
-        "Trinkets",
-        # 附魔杖/魔杖（装备）
-        "Rods", "Wands",
-        # 家具（所有职业）
-        "House Decor", "Stonework",
-    )
-    exclude_clause = " AND r.category NOT IN ({})".format(
-        ",".join("?" * len(EXCLUDE_CATEGORIES))
-    )
-
+    where, args = "", []
     if prof_ids:
-        placeholders = ",".join("?" * len(prof_ids))
-        rows = conn.execute(f"""
-            SELECT r.spell_id, r.name_zh, r.name, r.crafted_item_id, r.output_qty,
-                   r.category, r.profession_id, p.name_zh, p.name,
-                   r.skill_tier_id, t.name
-            FROM recipes r
-            JOIN professions p ON p.id = r.profession_id
-            JOIN skill_tiers t ON t.id = r.skill_tier_id
-            WHERE r.profession_id IN ({placeholders})
-            {exclude_clause}
-            ORDER BY r.skill_tier_id DESC, r.profession_id, r.name
-        """, prof_ids + list(EXCLUDE_CATEGORIES)).fetchall()
-    else:
-        rows = conn.execute(f"""
-            SELECT r.spell_id, r.name_zh, r.name, r.crafted_item_id, r.output_qty,
-                   r.category, r.profession_id, p.name_zh, p.name,
-                   r.skill_tier_id, t.name
-            FROM recipes r
-            JOIN professions p ON p.id = r.profession_id
-            JOIN skill_tiers t ON t.id = r.skill_tier_id
-            WHERE 1=1 {exclude_clause}
-            ORDER BY r.skill_tier_id DESC, r.profession_id, r.name
-        """, list(EXCLUDE_CATEGORIES)).fetchall()
+        where = "WHERE r.profession_id IN ({})".format(",".join("?" * len(prof_ids)))
+        args = list(prof_ids)
+    rows = conn.execute(f"""
+        SELECT r.recipe_id, r.name_zh, r.name, r.output_qty, r.category,
+               r.profession_id, p.name_zh, p.name, r.skill_tier_id, t.name
+        FROM recipes r
+        JOIN professions p ON p.id = r.profession_id
+        JOIN skill_tiers t ON t.id = r.skill_tier_id
+        {where}
+    """, args).fetchall()
 
-    result = []
-    for spell_id, name_zh, name, crafted_id, output_qty, category, prof_id, prof_zh, prof_en, tier_id, tier_name in rows:
-        reagents = conn.execute(
-            "SELECT item_id, quantity FROM recipe_reagents WHERE spell_id = ?",
-            (spell_id,)
-        ).fetchall()
-        output_ids_rows = conn.execute(
-            "SELECT item_id FROM recipe_outputs WHERE spell_id = ?",
-            (spell_id,)
-        ).fetchall()
-        output_ids = [r[0] for r in output_ids_rows] if output_ids_rows else ([crafted_id] if crafted_id else [])
-        result.append({
-            "spell_id":    spell_id,
-            "name":        name_zh or name,
-            "name_en":     name,
-            "crafted_id":  crafted_id,
-            "output_ids":  output_ids,
-            "output_qty":  output_qty,
-            "category":    category,
-            "prof_id":     prof_id,
-            "prof_name":   prof_zh or prof_en,
-            "reagents":    reagents,
-            "tier_id":     tier_id,
-            "tier_name":   tier_name,
-            "quality_star": None,  # 由下方赋值
-        })
+    reagents, outputs = defaultdict(list), defaultdict(list)
+    for rid, iid, qty in conn.execute("SELECT recipe_id, item_id, quantity FROM recipe_reagents"):
+        reagents[rid].append((iid, qty))
+    for rid, iid, rank in conn.execute("SELECT recipe_id, item_id, quality_rank FROM recipe_outputs"):
+        outputs[rid].append((iid, rank))
 
-    # 龙岛+版本：同职业同tier同名配方按 crafted_item_id 升序打星标（Q1最小ID→★，以此类推）
-    quality_groups = defaultdict(list)
-    for rec in result:
-        if rec["tier_id"] >= _QUALITY_TIER_MIN and rec["crafted_id"]:
-            quality_groups[(rec["prof_id"], rec["tier_id"], rec["name_en"])].append(rec)
-    for group in quality_groups.values():
-        if len(group) > 1:
-            group.sort(key=lambda x: x["crafted_id"])
-            for i, rec in enumerate(group):
-                rec["quality_star"] = _STAR[i] if i < len(_STAR) else f"Q{i+1}"
-
-    return result
+    return [{
+        "recipe_id":  rid,
+        "name":       name_zh or name,
+        "name_en":    name,
+        "output_qty": output_qty,
+        "category":   category,
+        "prof_id":    prof_id,
+        "prof_name":  prof_zh or prof_en,
+        "tier_id":    tier_id,
+        "tier_name":  tier_name,
+        "reagents":   reagents[rid],
+        "outputs":    sorted(outputs[rid], key=lambda o: o[1] or 0),
+    } for rid, name_zh, name, output_qty, category, prof_id, prof_zh, prof_en, tier_id, tier_name in rows]
 
 
 def analyze(recipes, price_map):
+    """
+    每个配方计算：
+      cost        — 材料按吃单均价买 BATCH 次制作所需数量（龙岛+ 材料用最低品质）
+      profit_low  — 卖出最低品质产出的利润（保守，任何技能都能做出）
+      profit      — 卖出最高品质产出的利润（需要足够技能/专注/高品质材料）
+    """
     results = []
-
     for rec in recipes:
-        crafted_id = rec["crafted_id"]
-        output_qty = rec["output_qty"]
-
-        cost = 0
-        mat_detail = []
-        ok = True
+        if not rec["outputs"]:
+            continue
+        cost, mats = 0, []
         for item_id, qty in rec["reagents"]:
-            p = floor_price(price_map, item_id)
+            p = buy_price(price_map, item_id, qty * BATCH)
             if p is None:
-                ok = False
+                cost = None
                 break
             cost += p * qty
-            mat_detail.append((item_id, qty, p))
-
-        if not ok:
+            mats.append((item_id, qty, int(p)))
+        if cost is None:
             continue
 
-        # 取价格最高的产出（多产出时如 WotLK proc，取高价那个）
-        best = None
-        for oid in rec["output_ids"]:
-            p = floor_price(price_map, oid)
-            if p is None:
-                continue
-            _, qty, listings = market_info(price_map, oid)
-            if best is None or p > best["sell_price"]:
-                best = {"sell_id": oid, "sell_price": p, "sell_qty": qty, "sell_listings": listings}
-
-        if best is None:
+        priced = []
+        for oid, rank in rec["outputs"]:
+            p = sell_price(price_map, oid)
+            if p is not None:
+                _, qty, listings = market_info(price_map, oid, min_copper=0)
+                priced.append({"id": oid, "rank": rank, "price": p, "qty": qty, "listings": listings})
+        if not priced:
             continue
 
-        sell_price = best["sell_price"]
-        sell_total = int(sell_price * output_qty * (1 - AH_FEE))
-        profit     = sell_total - cost
-        name = rec["name"] + (" " + rec["quality_star"] if rec["quality_star"] else "")
+        def revenue(o):
+            return int(o["price"] * rec["output_qty"] * (1 - AH_FEE))
+
+        low  = priced[0]
+        best = max(priced, key=lambda o: o["price"])
+        rank_str = f" R{best['rank']}" if best["rank"] else ""
         results.append({
-            "name":          name,
-            "name_en":       rec["name_en"],
-            "category":      rec["category"],
-            "prof_id":       rec["prof_id"],
-            "prof_name":     rec["prof_name"],
-            "tier_id":       rec["tier_id"],
-            "tier_name":     rec["tier_name"],
-            "spell_id":      rec["spell_id"],
-            "crafted_id":    best["sell_id"],
-            "output_qty":    output_qty,
-            "cost":          cost,
-            "sell_price":    sell_price,
-            "sell_total":    sell_total,
-            "profit":        profit,
-            "materials":     mat_detail,
-            "sell_qty":      best["sell_qty"],
-            "sell_listings": best["sell_listings"],
+            **{k: rec[k] for k in ("recipe_id", "name_en", "category", "prof_id",
+                                   "prof_name", "tier_id", "tier_name", "output_qty")},
+            "name":          rec["name"] + rank_str,
+            "crafted_id":    best["id"],
+            "rank":          best["rank"],
+            "cost":          int(cost),
+            "sell_price":    best["price"],
+            "sell_total":    revenue(best),
+            "profit":        revenue(best) - int(cost),
+            "low_rank":      low["rank"],
+            "profit_low":    revenue(low) - int(cost),
+            "materials":     mats,
+            "sell_qty":      best["qty"],
+            "sell_listings": best["listings"],
+            "ranks":         [(o["rank"], o["id"], o["price"], o["qty"]) for o in priced],
         })
 
     results.sort(key=lambda x: x["profit"], reverse=True)
-
-    # 同一 crafted_id 全局去重
-    seen = set()
-    deduped = []
-    for r in results:
-        if r["crafted_id"] not in seen:
-            seen.add(r["crafted_id"])
-            deduped.append(r)
-
-    return deduped
-
-
-_STAR = ["★", "★★", "★★★", "★★★★", "★★★★★"]
-# 龙岛及以后才有制作品质分级系统（tier_id >= 2822）
-_QUALITY_TIER_MIN = 2822
+    return results
 
 
 _PROF_SUFFIXES = [
@@ -312,21 +256,20 @@ def print_results(results):
     profitable = [r for r in results if r["profit"] > 0]
     losing     = [r for r in results if r["profit"] <= 0]
 
-    print(f"\n{'='*100}")
+    print(f"\n{'='*110}")
     print(f"  全职业套利分析  —  盈利 {len(profitable)} 个 / 亏损 {len(losing)} 个")
-    print(f"{'='*100}")
-    print(f"  {'配方':<26}  {'材料成本':>12}  {'卖合计':>12}  {'总利润':>12}  {'挂单量':>6}  {'卖家数':>6}")
-    print(f"  {'-'*98}")
+    print(f"{'='*110}")
+    print(f"  {'配方':<26}  {'产出':>4}  {'材料成本':>12}  {'卖合计':>12}  {'最高品质利润':>12}  {'最低品质利润':>12}  {'挂单量':>6}")
+    print(f"  {'-'*108}")
 
     for exp, tier_id, profs in _group_by_tier(profitable):
         print(f"\n  ══ {exp} ══")
         for prof_name, items in profs:
             print(f"\n    ── {prof_name} ──")
             for r in items:
-                print(f"  {r['name']:<26}  "
+                print(f"  {r['name']:<26}  {r['output_qty']:>4g}  "
                       f"{g(r['cost']):>12}  {g(r['sell_total']):>12}  "
-                      f"{g(r['profit']):>12}  "
-                      f"{r['sell_qty']:>6}  {r['sell_listings']:>6}")
+                      f"{g(r['profit']):>12}  {g(r['profit_low']):>12}  {r['sell_qty']:>6}")
 
     if losing:
         print(f"\n\n  亏损配方共 {len(losing)} 个（略）")
@@ -474,17 +417,21 @@ def write_report(results, price_map=None, path="full_report.md"):
 
     lines = [f"# WoW 全职业套利分析报告\n",
              f"盈利配方 {len(profitable)} 个 | 亏损配方 {len(losing)} 个\n",
+             f"> 材料成本按连续制作 {BATCH} 次的吃单均价计算；卖价为最低挂单价，已扣 {AH_FEE:.0%} 手续费。",
+             f"> “最高品质利润”假设能做出最高品质（R2/R3）；“最低品质利润”为保守值。未计入多重制作/省料加成。\n",
              f"## 盈利配方\n"]
 
     for exp, tier_id, profs in _group_by_tier(profitable):
         lines.append(f"## {exp}\n")
         for prof_name, items in profs:
             lines.append(f"### {prof_name}\n")
-            lines.append("| 配方 | 材料成本 | 卖合计 | 总利润 | 利润率 | 挂单量 | 卖家数 |")
-            lines.append("|---|---|---|---|---|---|---|")
+            lines.append("| 配方 | 每次产出 | 材料成本 | 卖合计 | 最高品质利润 | 利润率 | 最低品质利润 | 挂单量 | 卖家数 |")
+            lines.append("|---|---|---|---|---|---|---|---|---|")
             for r in items:
                 margin = int(r["profit"] / r["cost"] * 100) if r["cost"] else 0
-                lines.append(f"| {r['name']} | {g(r['cost'])} | {g(r['sell_total'])} | {g(r['profit'])} | {margin}% | {r['sell_qty']} | {r['sell_listings']} |")
+                lines.append(f"| {r['name']} | {r['output_qty']:g} | {g(r['cost'])} | {g(r['sell_total'])} | "
+                             f"{g(r['profit'])} | {margin}% | {g(r['profit_low'])} | "
+                             f"{r['sell_qty']} | {r['sell_listings']} |")
             lines.append("")
 
     lines.append(f"---\n亏损配方共 {len(losing)} 个（略）\n")
@@ -505,11 +452,19 @@ def write_report(results, price_map=None, path="full_report.md"):
 # ──────────────────────────────────────────────
 
 def main():
-    # 可选：python ah_analyzer.py 171 333  → 只跑指定职业
-    prof_ids = [int(x) for x in sys.argv[1:]] if len(sys.argv) > 1 else None
+    # python ah_analyzer.py [prof_id ...] [--cached]
+    #   --cached  复用上次保存的 commodities_raw.json，不重新拉取
+    args = sys.argv[1:]
+    prof_ids = [int(x) for x in args if x.isdigit()] or None
 
-    token = get_token()
-    auctions = fetch_commodities(token)
+    if "--cached" in args and os.path.exists(SNAPSHOT):
+        with open(SNAPSHOT, encoding="utf-8") as f:
+            auctions = json.load(f)
+        print(f"[OK] 读取本地快照 {SNAPSHOT}：{len(auctions)} 条挂单")
+    else:
+        auctions = fetch_commodities(get_token())
+        with open(SNAPSHOT, "w", encoding="utf-8") as f:
+            json.dump(auctions, f)
     price_map = build_price_map(auctions)
 
     conn = sqlite3.connect(DB_FILE)

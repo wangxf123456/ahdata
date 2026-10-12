@@ -3,3 +3,6 @@ __pycache__/
 *.pyc
 .env
 commodities_raw.json
+build_cache/
+analysis.json
+full_report.md
